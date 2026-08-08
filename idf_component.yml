@@ -4,6 +4,6 @@ repository: git://git@github.com:nicolai-electronics/esp32-component-tanmatsu-ad
 issues: https://github.com/nicolai-electronics/esp32-component-tanmatsu-addon/issues
 dependencies:
   idf: ">=5.5"
-  badgeteam/badge-bsp: ">=0.8.0"
-  nicolaielectronics/eeprom: ">=1.0.0"
+  badgeteam/badge-bsp: ">=1.2.0"
+  nicolaielectronics/eeprom: "^2.0.1"
 license: "MIT"

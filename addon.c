@@ -1,10 +1,13 @@
 #include "addon.h"
+#include "bsp/catt.h"
 #include "bsp/i2c.h"
+#include "bsp/sao.h"
 #include "driver/i2c_master.h"
 #include "driver/i2c_types.h"
 #include "eeprom.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "include/addon.h"
 #include "sdkconfig.h"
 
 // Descriptor structures
@@ -41,19 +44,13 @@ typedef struct __attribute__((__packed__)) {
 
 static const char TAG[] = "Add-on";
 
-static i2c_master_bus_handle_t internal_i2c_bus_handle    = NULL;
-static SemaphoreHandle_t       internal_i2c_bus_semaphore = NULL;
-static eeprom_handle_t         internal_eeprom_handle     = {0};
-static addon_descriptor_t*     internal_addon_descriptor  = NULL;
-
-static i2c_master_bus_handle_t external_i2c_bus_handle    = NULL;
-static SemaphoreHandle_t       external_i2c_bus_semaphore = NULL;
-static eeprom_handle_t         external_eeprom_handle     = {0};
-static addon_descriptor_t*     external_addon_descriptor  = NULL;
+static addon_descriptor_t* internal_addon_descriptor = NULL;
+static addon_descriptor_t* catt_addon_descriptor     = NULL;
+static addon_descriptor_t* sao_addon_descriptor      = NULL;
 
 // Helper functions
 
-static esp_err_t addon_parse_binary_sao_descriptor(eeprom_handle_t* eeprom, addon_descriptor_t* descriptor) {
+static esp_err_t addon_parse_binary_sao_descriptor(eeprom_configuration_t* eeprom, addon_descriptor_t* descriptor) {
     if (descriptor == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -192,7 +189,7 @@ static esp_err_t addon_parse_binary_sao_descriptor(eeprom_handle_t* eeprom, addo
     return ESP_OK;
 }
 
-static esp_err_t addon_parse_json_descriptor(eeprom_handle_t* eeprom, addon_descriptor_t* descriptor) {
+static esp_err_t addon_parse_json_descriptor(eeprom_configuration_t* eeprom, addon_descriptor_t* descriptor) {
     if (descriptor == NULL || descriptor->descriptor_type != ADDON_TYPE_JSON) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -222,13 +219,13 @@ static esp_err_t addon_parse_json_descriptor(eeprom_handle_t* eeprom, addon_desc
     return ESP_OK;
 }
 
-static esp_err_t addon_parse_hexpansion_catt_descriptor(eeprom_handle_t* eeprom, addon_descriptor_t* descriptor,
-                                                        addon_descriptor_type_t type) {
+static esp_err_t addon_parse_hexpansion_catt_descriptor(eeprom_configuration_t* eeprom,
+                                                        addon_descriptor_t*     descriptor) {
     if (descriptor == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (type != ADDON_TYPE_HEXPANSION && type != ADDON_TYPE_CATT) {
+    if (descriptor->descriptor_type != ADDON_TYPE_HEXPANSION && descriptor->descriptor_type != ADDON_TYPE_CATT) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
@@ -237,14 +234,18 @@ static esp_err_t addon_parse_hexpansion_catt_descriptor(eeprom_handle_t* eeprom,
     esp_err_t     res    = eeprom_read(eeprom, 0x00, (uint8_t*)&header, sizeof(catt_header_t));
     if (res != ESP_OK) return res;
 
-    if (type == ADDON_TYPE_HEXPANSION && memcmp(descriptor->catt.manifest_version, "2024", 4) != 0) {
+    if (descriptor->descriptor_type == ADDON_TYPE_HEXPANSION && memcmp(header.manifest_version, "2024", 4) != 0) {
+        ESP_LOGW(TAG, "THEX addon with unsupported manifest type '%c%c%c%c'", header.manifest_version[0],
+                 header.manifest_version[1], header.manifest_version[2], header.manifest_version[3]);
         return ESP_ERR_NOT_SUPPORTED;
-    } else if (type == ADDON_TYPE_CATT && memcmp(descriptor->catt.manifest_version, "0001", 4) != 0) {
+    } else if (descriptor->descriptor_type == ADDON_TYPE_CATT && memcmp(header.manifest_version, "0001", 4) != 0) {
+        ESP_LOGW(TAG, "CATT addon with unsupported manifest type '%c%c%c%c'", header.manifest_version[0],
+                 header.manifest_version[1], header.manifest_version[2], header.manifest_version[3]);
         return ESP_ERR_NOT_SUPPORTED;
     }
 
     uint8_t calculated_checksum = 0x55;
-    for (size_t i = 1; i < sizeof(catt_header_t); i++) {
+    for (size_t i = 1; i < sizeof(catt_header_t) - sizeof(uint8_t); i++) {
         calculated_checksum ^= ((uint8_t*)&header)[i];
     }
     if (calculated_checksum != header.checksum) {
@@ -267,26 +268,37 @@ static esp_err_t addon_parse_hexpansion_catt_descriptor(eeprom_handle_t* eeprom,
     return ESP_OK;
 }
 
-static esp_err_t addon_detect(i2c_master_bus_handle_t bus, SemaphoreHandle_t semaphore, eeprom_handle_t* eeprom,
-                              addon_location_t location, addon_descriptor_t** out_descriptor) {
-    if (*out_descriptor != NULL) {
-        // Already detected
-        return ESP_OK;
+static void addon_free_if_allocated(addon_descriptor_t** descriptor) {
+    if ((*descriptor) == NULL) {
+        return;
     }
-
-    if (eeprom->i2c_device == NULL) {
-        // Initialize EEPROM driver
-        esp_err_t res = eeprom_init(eeprom, bus, semaphore, 0x50, 16, false);
-        if (res != ESP_OK) {
-            res = eeprom_init(eeprom, bus, semaphore, 0x57, 16, false);
-            if (res != ESP_OK) {
-                return ESP_ERR_NOT_FOUND;
-            }
+    if ((*descriptor)->descriptor_type == ADDON_TYPE_BINARY_SAO) {
+        for (uint8_t i = 0; i < (*descriptor)->binary_sao.amount_of_drivers; i++) {
+            free((*descriptor)->binary_sao.drivers[i].name);
+            free((*descriptor)->binary_sao.drivers[i].data);
         }
+        free((*descriptor)->binary_sao.drivers);
+        free((*descriptor)->binary_sao.name);
+    } else if ((*descriptor)->descriptor_type == ADDON_TYPE_JSON) {
+        free((*descriptor)->json.json_text);
     }
+    free((*descriptor));
+    *descriptor = NULL;
+}
+
+static esp_err_t addon_detect(addon_location_t location, i2c_master_dev_handle_t device,
+                              addon_descriptor_t** out_descriptor) {
+    addon_free_if_allocated(out_descriptor);
+
+    eeprom_configuration_t eeprom_config = {
+        .device        = device,
+        .page_size     = 16,
+        .address_16bit = false,
+        .timeout_ms    = 100,
+    };
 
     char      magic[4] = "";
-    esp_err_t res      = eeprom_read(eeprom, 0x00, (uint8_t*)magic, sizeof(magic));
+    esp_err_t res      = eeprom_read(&eeprom_config, 0, (uint8_t*)magic, sizeof(magic));
     if (res != ESP_OK) {
         return res;
     }
@@ -302,13 +314,23 @@ static esp_err_t addon_detect(i2c_master_bus_handle_t bus, SemaphoreHandle_t sem
     if (memcmp(magic, "\0\0\0\0", sizeof(magic)) == 0 || memcmp(magic, "\xFF\xFF\xFF\xFF", sizeof(magic)) == 0) {
         (*out_descriptor)->descriptor_type = ADDON_TYPE_UNINITIALIZED;
     } else if (memcmp(magic, "LIFE", sizeof(magic)) == 0) {
-        addon_parse_binary_sao_descriptor(eeprom, *out_descriptor);
+        ESP_LOGI(TAG, "Found LIFE magic value in add-on EEPROM");
+        (*out_descriptor)->descriptor_type = ADDON_TYPE_BINARY_SAO;
+        addon_parse_binary_sao_descriptor(&eeprom_config, *out_descriptor);
     } else if (memcmp(magic, "JSON", sizeof(magic)) == 0) {
-        addon_parse_json_descriptor(eeprom, *out_descriptor);
+        ESP_LOGI(TAG, "Found JSON magic value in add-on EEPROM");
+        (*out_descriptor)->descriptor_type = ADDON_TYPE_JSON;
+        addon_parse_json_descriptor(&eeprom_config, *out_descriptor);
     } else if (memcmp(magic, "THEX", sizeof(magic)) == 0) {
-        addon_parse_hexpansion_catt_descriptor(eeprom, *out_descriptor, ADDON_TYPE_HEXPANSION);
+        ESP_LOGI(TAG, "Found THEX magic value in add-on EEPROM");
+        (*out_descriptor)->descriptor_type = ADDON_TYPE_HEXPANSION;
+        addon_parse_hexpansion_catt_descriptor(&eeprom_config, *out_descriptor);
     } else if (memcmp(magic, "CATT", sizeof(magic)) == 0) {
-        addon_parse_hexpansion_catt_descriptor(eeprom, *out_descriptor, ADDON_TYPE_CATT);
+        (*out_descriptor)->descriptor_type = ADDON_TYPE_CATT;
+        ESP_LOGI(TAG, "Found CATT magic value in add-on EEPROM");
+        addon_parse_hexpansion_catt_descriptor(&eeprom_config, *out_descriptor);
+    } else {
+        ESP_LOGI(TAG, "Unknown magic value in add-on EEPROM: '%c%c%c%c'", magic[0], magic[1], magic[2], magic[3]);
     }
 
     return ESP_OK;
@@ -321,8 +343,8 @@ esp_err_t addon_print_descriptor(addon_descriptor_t* descriptor) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    const char* location_str = descriptor->location == ADDON_LOCATION_INTERNAL ? "Internal" : "External";
-    const char* type_str     = "Unknown";
+    const char* location_str = descriptor->location == ADDON_LOCATION_INTERNAL ? "internal" : "external";
+    const char* type_str     = "unknown";
 
     switch (descriptor->descriptor_type) {
         case ADDON_TYPE_UNINITIALIZED:
@@ -380,68 +402,323 @@ esp_err_t addon_print_descriptor(addon_descriptor_t* descriptor) {
     return ESP_OK;
 }
 
-esp_err_t addon_initialize(void) {
-    esp_err_t res = bsp_i2c_primary_bus_get_handle(&internal_i2c_bus_handle);
-    if (res == ESP_OK) {
-        // Primary I2C bus available
-        bsp_i2c_primary_bus_get_semaphore(&internal_i2c_bus_semaphore);
-        res = addon_detect(internal_i2c_bus_handle, internal_i2c_bus_semaphore, &internal_eeprom_handle,
-                           ADDON_LOCATION_INTERNAL, &internal_addon_descriptor);
-        if (res == ESP_OK) {
-            ESP_LOGI(TAG, "Internal add-on detected");
-            addon_print_descriptor(internal_addon_descriptor);
-        } else {
-            ESP_LOGI(TAG, "No internal add-on detected");
-        }
+void addon_read_descriptor(addon_location_t location) {
+    // Get and free add-on descriptor pointer
+    addon_descriptor_t** descriptor = NULL;
+
+    switch (location) {
+        case ADDON_LOCATION_INTERNAL:
+            descriptor = &internal_addon_descriptor;
+            break;
+        case ADDON_LOCATION_CATT:
+            descriptor = &catt_addon_descriptor;
+            break;
+        case ADDON_LOCATION_SAO:
+            descriptor = &sao_addon_descriptor;
+            break;
+        default:
+            break;
     }
 
-#ifdef CONFIG_BSP_TARGET_TANMATSU
-    i2c_master_bus_config_t sao_i2c_master_config = {
-        .clk_source                   = I2C_CLK_SRC_DEFAULT,
-        .i2c_port                     = 1,
-        .scl_io_num                   = 13,
-        .sda_io_num                   = 12,
-        .glitch_ignore_cnt            = 7,
-        .flags.enable_internal_pullup = true,
-    };
+    if (descriptor == NULL) {
+        return;
+    }
 
-    external_i2c_bus_semaphore = xSemaphoreCreateBinary();
-    if (external_i2c_bus_semaphore != NULL) {
-        xSemaphoreGive(external_i2c_bus_semaphore);
-        res = i2c_new_master_bus(&sao_i2c_master_config, &external_i2c_bus_handle);
-        if (res == ESP_OK) {
-            res = addon_detect(external_i2c_bus_handle, external_i2c_bus_semaphore, &external_eeprom_handle,
-                               ADDON_LOCATION_EXTERNAL, &external_addon_descriptor);
-            if (res == ESP_OK) {
-                ESP_LOGI(TAG, "External add-on detected");
-                addon_print_descriptor(external_addon_descriptor);
-            } else {
-                ESP_LOGI(TAG, "No external add-on detected");
-                i2c_del_master_bus(external_i2c_bus_handle);
-                external_i2c_bus_handle = NULL;
-                vSemaphoreDelete(external_i2c_bus_semaphore);
-                external_i2c_bus_semaphore = NULL;
+    addon_free_if_allocated(descriptor);
+
+    // Get I2C bus handle
+
+    i2c_master_bus_handle_t i2c_bus_handle = NULL;
+    esp_err_t               res            = ESP_OK;
+
+    switch (location) {
+        case ADDON_LOCATION_INTERNAL: {
+            res = bsp_i2c_primary_bus_get_handle(&i2c_bus_handle);
+            if (res != ESP_OK) {
+                ESP_LOGW(TAG, "No internal add-on: I2C bus handle unavailable");
+                return;
             }
+            break;
         }
+        case ADDON_LOCATION_CATT: {
+            res = bsp_catt_set_i2c_enabled(true);
+            if (res != ESP_OK) {
+                ESP_LOGW(TAG, "No CATT add-on: I2C bus unavailable");
+                return;
+            }
+            res = bsp_catt_i2c_bus_get_handle(&i2c_bus_handle);
+            if (res != ESP_OK) {
+                ESP_LOGW(TAG, "No CATT add-on: I2C bus handle unavailable");
+                return;
+            }
+            break;
+        }
+        case ADDON_LOCATION_SAO: {
+            res = bsp_sao_i2c_bus_get_handle(&i2c_bus_handle);
+            if (res != ESP_OK) {
+                ESP_LOGW(TAG, "No SAO add-on: I2C bus handle unavailable");
+                return;
+            }
+            i2c_master_bus_handle_t catt_bus_handle = NULL;
+            bsp_catt_i2c_bus_get_handle(&catt_bus_handle);
+            if (i2c_bus_handle == catt_bus_handle) {
+                sao_addon_descriptor = catt_addon_descriptor;
+                ESP_LOGI(TAG, "Skipping SAO add-on read, SAO port is CATT port on this device");
+                return;
+            }
+            break;
+        }
+        default:
+            break;
     }
-#endif
 
-    return ESP_OK;
+    // Get I2C bus handle
+    if (i2c_bus_handle == NULL) {
+        return;
+    }
+
+    // Initialize EEPROM I2C device
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = 0x50,
+        .scl_speed_hz    = 400000,
+    };
+    i2c_master_dev_handle_t i2c_device_handle = NULL;
+    res                                       = i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &i2c_device_handle);
+    if (res != ESP_OK || i2c_device_handle == NULL) {
+        return;
+    }
+
+    res = addon_detect(location, i2c_device_handle, descriptor);
+    if (res == ESP_OK) {
+        ESP_LOGI(TAG, "Add-on detected");
+        addon_print_descriptor(*descriptor);
+    } else {
+        ESP_LOGW(TAG, "No add-on detected");
+    }
+
+    i2c_master_bus_rm_device(i2c_device_handle);
 }
 
-esp_err_t addon_get_descriptor(addon_location_t location, addon_descriptor_t** out_descriptor) {
+addon_descriptor_t* addon_get_descriptor(addon_location_t location) {
     if (location == ADDON_LOCATION_INTERNAL) {
-        if (internal_addon_descriptor != NULL) {
-            *out_descriptor = internal_addon_descriptor;
-            return ESP_OK;
-        }
-        return ESP_ERR_NOT_FOUND;
-    } else if (location == ADDON_LOCATION_EXTERNAL) {
-        if (external_addon_descriptor != NULL) {
-            *out_descriptor = external_addon_descriptor;
-            return ESP_OK;
-        }
-        return ESP_ERR_NOT_FOUND;
+        return internal_addon_descriptor;
     }
-    return ESP_ERR_NOT_SUPPORTED;  // Location not available
+    if (location == ADDON_LOCATION_CATT) {
+        return catt_addon_descriptor;
+    }
+    if (location == ADDON_LOCATION_SAO) {
+        return sao_addon_descriptor;
+    }
+    return NULL;
+}
+
+esp_err_t addon_set_descriptor(addon_location_t location, addon_descriptor_t* descriptor) {
+    if (descriptor == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Get I2C bus handle
+
+    i2c_master_bus_handle_t i2c_bus_handle = NULL;
+    esp_err_t               res            = ESP_OK;
+
+    switch (location) {
+        case ADDON_LOCATION_INTERNAL: {
+            res = bsp_i2c_primary_bus_get_handle(&i2c_bus_handle);
+            if (res != ESP_OK) {
+                ESP_LOGW(TAG, "No internal add-on: I2C bus handle unavailable");
+                return ESP_FAIL;
+            }
+            break;
+        }
+        case ADDON_LOCATION_CATT: {
+            res = bsp_catt_set_i2c_enabled(true);
+            if (res != ESP_OK) {
+                ESP_LOGW(TAG, "No CATT add-on: I2C bus unavailable");
+                return ESP_FAIL;
+            }
+            res = bsp_catt_i2c_bus_get_handle(&i2c_bus_handle);
+            if (res != ESP_OK) {
+                ESP_LOGW(TAG, "No CATT add-on: I2C bus handle unavailable");
+                return ESP_FAIL;
+            }
+            break;
+        }
+        case ADDON_LOCATION_SAO: {
+            res = bsp_sao_i2c_bus_get_handle(&i2c_bus_handle);
+            if (res != ESP_OK) {
+                ESP_LOGW(TAG, "No SAO add-on: I2C bus handle unavailable");
+                return ESP_FAIL;
+            }
+            i2c_master_bus_handle_t catt_bus_handle = NULL;
+            bsp_catt_i2c_bus_get_handle(&catt_bus_handle);
+            if (i2c_bus_handle == catt_bus_handle) {
+                ESP_LOGI(TAG, "Writing to SAO add-on is not supported, SAO port is CATT port on this device");
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    // Get I2C bus handle
+    if (i2c_bus_handle == NULL) {
+        return ESP_FAIL;
+    }
+
+    // Initialize EEPROM I2C device
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = 0x50,
+        .scl_speed_hz    = 400000,
+    };
+    i2c_master_dev_handle_t i2c_device_handle = NULL;
+    res                                       = i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &i2c_device_handle);
+    if (res != ESP_OK || i2c_device_handle == NULL) {
+        return ESP_FAIL;
+    }
+
+    eeprom_configuration_t eeprom_config = {
+        .device        = i2c_device_handle,
+        .page_size     = 16,
+        .address_16bit = false,
+        .timeout_ms    = 100,
+    };
+
+    switch (descriptor->descriptor_type) {
+        case ADDON_TYPE_BINARY_SAO: {
+            if (descriptor->binary_sao.amount_of_drivers == 0 || descriptor->binary_sao.name == NULL ||
+                descriptor->binary_sao.drivers == NULL || descriptor->binary_sao.drivers[0].name == NULL) {
+                return ESP_ERR_INVALID_ARG;
+            }
+
+            sao_binary_header_t header = {
+                .magic                   = {'L', 'I', 'F', 'E'},
+                .name_length             = (uint8_t)strlen(descriptor->binary_sao.name),
+                .driver_name_length      = (uint8_t)strlen(descriptor->binary_sao.drivers[0].name),
+                .driver_data_length      = descriptor->binary_sao.drivers[0].data_length,
+                .number_of_extra_drivers = descriptor->binary_sao.amount_of_drivers - 1,
+            };
+
+            uint16_t address = 0;
+
+            res = eeprom_write(&eeprom_config, address, (uint8_t*)&header, sizeof(header));
+            if (res != ESP_OK) return res;
+            address += sizeof(header);
+
+            if (header.name_length > 0) {
+                res = eeprom_write(&eeprom_config, address, (uint8_t*)descriptor->binary_sao.name, header.name_length);
+                if (res != ESP_OK) return res;
+            }
+            address += header.name_length;
+
+            if (header.driver_name_length > 0) {
+                res = eeprom_write(&eeprom_config, address, (uint8_t*)descriptor->binary_sao.drivers[0].name,
+                                   header.driver_name_length);
+                if (res != ESP_OK) return res;
+            }
+            address += header.driver_name_length;
+
+            if (header.driver_data_length > 0) {
+                res = eeprom_write(&eeprom_config, address, descriptor->binary_sao.drivers[0].data,
+                                   header.driver_data_length);
+                if (res != ESP_OK) return res;
+            }
+            address += header.driver_data_length;
+
+            for (uint8_t i = 1; i < descriptor->binary_sao.amount_of_drivers; i++) {
+                if (descriptor->binary_sao.drivers[i].name == NULL) {
+                    return ESP_ERR_INVALID_ARG;
+                }
+                sao_binary_extra_driver_t extra_header = {
+                    .driver_name_length = (uint8_t)strlen(descriptor->binary_sao.drivers[i].name),
+                    .driver_data_length = descriptor->binary_sao.drivers[i].data_length,
+                };
+
+                res = eeprom_write(&eeprom_config, address, (uint8_t*)&extra_header, sizeof(extra_header));
+                if (res != ESP_OK) return res;
+                address += sizeof(extra_header);
+
+                if (extra_header.driver_name_length > 0) {
+                    res = eeprom_write(&eeprom_config, address, (uint8_t*)descriptor->binary_sao.drivers[i].name,
+                                       extra_header.driver_name_length);
+                    if (res != ESP_OK) return res;
+                }
+                address += extra_header.driver_name_length;
+
+                if (extra_header.driver_data_length > 0) {
+                    res = eeprom_write(&eeprom_config, address, descriptor->binary_sao.drivers[i].data,
+                                       extra_header.driver_data_length);
+                    if (res != ESP_OK) return res;
+                }
+                address += extra_header.driver_data_length;
+            }
+            break;
+        }
+
+        case ADDON_TYPE_JSON: {
+            if (descriptor->json.json_text == NULL) {
+                return ESP_ERR_INVALID_ARG;
+            }
+            uint8_t json_size = (uint8_t)strlen(descriptor->json.json_text);
+            uint8_t magic[4]  = {'J', 'S', 'O', 'N'};
+
+            res = eeprom_write(&eeprom_config, 0x00, magic, sizeof(magic));
+            if (res != ESP_OK) return res;
+
+            res = eeprom_write(&eeprom_config, 0x04, &json_size, sizeof(json_size));
+            if (res != ESP_OK) return res;
+
+            if (json_size > 0) {
+                res = eeprom_write(&eeprom_config, 0x05, (uint8_t*)descriptor->json.json_text, json_size);
+                if (res != ESP_OK) return res;
+            }
+            break;
+        }
+
+        case ADDON_TYPE_HEXPANSION:
+        case ADDON_TYPE_CATT: {
+            catt_header_t header = {0};
+
+            if (descriptor->descriptor_type == ADDON_TYPE_HEXPANSION) {
+                memcpy(header.magic, "THEX", 4);
+                memcpy(header.manifest_version, "2024", 4);
+            } else {
+                memcpy(header.magic, "CATT", 4);
+                memcpy(header.manifest_version, "0001", 4);
+            }
+            header.filesystem_info.offset[0]     = (descriptor->catt.filesystem_info.offset >> 8) & 0xFF;
+            header.filesystem_info.offset[1]     = descriptor->catt.filesystem_info.offset & 0xFF;
+            header.filesystem_info.page_size[0]  = (descriptor->catt.filesystem_info.page_size >> 8) & 0xFF;
+            header.filesystem_info.page_size[1]  = descriptor->catt.filesystem_info.page_size & 0xFF;
+            header.filesystem_info.total_size[0] = (descriptor->catt.filesystem_info.total_size >> 24) & 0xFF;
+            header.filesystem_info.total_size[1] = (descriptor->catt.filesystem_info.total_size >> 16) & 0xFF;
+            header.filesystem_info.total_size[2] = (descriptor->catt.filesystem_info.total_size >> 8) & 0xFF;
+            header.filesystem_info.total_size[3] = descriptor->catt.filesystem_info.total_size & 0xFF;
+            header.vendor_id[0]                  = (descriptor->catt.vendor_id >> 8) & 0xFF;
+            header.vendor_id[1]                  = descriptor->catt.vendor_id & 0xFF;
+            header.product_id[0]                 = (descriptor->catt.product_id >> 8) & 0xFF;
+            header.product_id[1]                 = descriptor->catt.product_id & 0xFF;
+            header.unique_id[0]                  = (descriptor->catt.unique_id >> 8) & 0xFF;
+            header.unique_id[1]                  = descriptor->catt.unique_id & 0xFF;
+            memcpy(header.name, descriptor->catt.name, sizeof(header.name));
+
+            uint8_t checksum = 0x55;
+            for (size_t i = 1; i < sizeof(catt_header_t) - 1; i++) {
+                checksum ^= ((uint8_t*)&header)[i];
+            }
+            header.checksum = checksum;
+
+            printf("Writing %u bytes\r\n", sizeof(catt_header_t));
+            res = eeprom_write(&eeprom_config, 0x00, (uint8_t*)&header, sizeof(catt_header_t));
+            break;
+        }
+
+        default:
+            return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    return res;
 }
